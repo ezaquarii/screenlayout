@@ -1,13 +1,14 @@
 #!/usr/bin/python3
 
 import argparse
+import json
 import sys
 import subprocess
 
 from dataclasses import dataclass
 from enum import Enum
 
-from Xlib import display as xdisplay
+from Xlib import display as xdisplay, X
 from Xlib.ext import randr
 
 
@@ -19,9 +20,10 @@ class Orientation(Enum):
 @dataclass
 class Screen:
     name: str
-    xres: int
-    yres: int
-    connected: bool
+    xres: int = 0
+    yres: int = 0
+    connected: bool = False
+    serial: str = None
 
     def size(self, orientation: Orientation) -> (int, int):
         if orientation == Orientation.LANDSCAPE:
@@ -45,33 +47,84 @@ class Position:
     y: int
 
 
-def get_screens() -> list[Screen]:
-    d = xdisplay.Display()
-    root = d.screen().root
-    res = randr.get_screen_resources(root)
-    mode_map = {m['id']: (m['width'], m['height']) for m in res.modes}
-    screens = []
-    for output in res.outputs:
-        info = randr.get_output_info(root, output, res.config_timestamp)
-        connected = info.connection == 0
-        if connected and info.crtc:
-            crtc = randr.get_crtc_info(root, info.crtc, res.config_timestamp)
-            screens.append(Screen(name=info.name,
-                                  xres=crtc.width,
-                                  yres=crtc.height,
-                                  connected=True))
-        elif connected and info.modes:
-            w, h = mode_map[info.modes[0]]
-            screens.append(Screen(name=info.name,
-                                  xres=w,
-                                  yres=h,
-                                  connected=True))
-        else:
-            screens.append(Screen(name=info.name,
-                                  xres=0,
-                                  yres=0,
-                                  connected=connected))
-    return {s.name: s for s in screens}
+class Edid:
+    def __init__(self, blob=None):
+        self.serial = None
+        self.name = None
+        if not blob:
+            return
+        for i in range(54, 126, 18):
+            block = blob[i:i+18]
+            if len(block) < 18:
+                continue
+            elif block[:4] == b'\x00\x00\x00\xff':
+                self.serial = block[5:18].decode(errors="ignore").strip()
+            elif block[:4] == b'\x00\x00\x00\xfc':
+                self.name = block[5:18].decode(errors="ignore").strip()
+
+
+class Display:
+    def __init__(self, display: xdisplay.Display):
+        self._display = display
+        self._root = display.screen().root
+
+    def get_output_props(self, output: int) -> dict[str, int]:
+        prop_atoms = randr.list_output_properties(self._root,
+                                                  output).atoms
+        return {
+            self._display.get_atom_name(pa): pa for pa in prop_atoms
+        }
+
+    def get_output_edid(self, output: int) -> Edid:
+        edid_atom = self.get_output_props(output).get("EDID", None)
+        if not edid_atom:
+            return Edid()
+        blob = randr.get_output_property(self._root,
+                                         output,
+                                         edid_atom,
+                                         X.AnyPropertyType,
+                                         0,
+                                         128,
+                                         False,
+                                         False).value
+        return Edid(bytes(blob))
+
+    @property
+    def screens(self):
+        res = randr.get_screen_resources(self._root)
+        modes = {m['id']: (m['width'], m['height']) for m in res.modes}
+        screens = []
+        for output in res.outputs:
+            info = randr.get_output_info(self._root,
+                                         output,
+                                         res.config_timestamp)
+            connected = info.connection == 0
+            xres = 0
+            yres = 0
+            edid = self.get_output_edid(output)
+            if connected and info.crtc:
+                crtc = randr.get_crtc_info(self._root,
+                                           info.crtc,
+                                           res.config_timestamp)
+                xres = crtc.width
+                yres = crtc.height
+                screens.append(Screen(name=info.name,
+                                      xres=crtc.width,
+                                      yres=crtc.height,
+                                      connected=True,
+                                      serial=edid.serial))
+            elif connected and info.modes:
+                xres, yres = modes[info.modes[0]]
+                screens.append(Screen(name=info.name,
+                                      xres=xres,
+                                      yres=yres,
+                                      connected=True,
+                                      serial=edid.serial))
+            else:
+                screens.append(Screen(name=info.name,
+                                      connected=connected,
+                                      serial=edid.serial))
+        return screens
 
 
 def left_of(center: Screen,
@@ -112,7 +165,6 @@ def above(center: Screen,
     total = total_width(others)
     positions = []
     left_edge = -(total - center.xres) / 2
-    print(f"left: {left_edge}")
     for s in others:
         if not s.connected:
             positions.append((s, Position(x=0, y=0), Orientation.LANDSCAPE))
@@ -162,10 +214,27 @@ def xrandr_command(layout: Layout) -> list[str]:
     return cmd
 
 
-def build_layouts(screens: dict[str, Screen]) -> dict[str, Layout]:
-    left = screens["DP-1-1"]
-    right = screens["DP-1-2"]
-    center = screens["eDP-1"]
+def load_json(filename) -> dict:
+    try:
+        with open(filename, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def build_layouts(screens: list[Screen],
+                  left_serial=None,
+                  right_serial=None) -> dict[str, Layout]:
+    by_name = {s.name: s for s in screens}
+    by_serial = {s.serial: s for s in screens if s.serial is not None}
+
+    if left_serial in by_serial and right_serial in by_serial:
+        left = by_serial[left_serial]
+        right = by_serial[right_serial]
+    else:
+        left = by_name["DP-1-1"]
+        right = by_name["DP-1-2"]
+    center = by_name["eDP-1"]
 
     layouts = {
         "pp": Layout(center=center,
@@ -188,24 +257,19 @@ def build_layouts(screens: dict[str, Screen]) -> dict[str, Layout]:
     return layouts
 
 
-if __name__ == "__main__":
-    screens = get_screens()
-    layouts = build_layouts(screens)
+def show_main():
+    d = Display(xdisplay.Display())
+    screens = d.screens
+    for s in screens:
+        print(s)
 
-    parser = argparse.ArgumentParser(prog="screen layout",
-                                     description="configure connected monitors")
-    parser.add_argument("-v", "--verbose", action="store_true")
-    parser.add_argument("-t", "--dry-run", action="store_true")
-    parser.add_argument("layout", choices=sorted(layouts.keys()))
-    args = parser.parse_args()
 
-    if args.verbose:
-        for k, s in screens.items():
-            print(s)
-
-    layout = layouts[args.layout]
+def configure_main(layout_name, verbose=False, dry_run=False):
+    d = Display(xdisplay.Display())
+    layouts = build_layouts(d.screens)
+    layout = layouts[layout_name]
     opts = xrandr_command(layout)
-    if args.verbose:
+    if verbose:
         for c in opts:
             print("xrandr", *c)
 
@@ -213,8 +277,34 @@ if __name__ == "__main__":
     for o in opts:
         cmd.extend(o)
 
-    if args.dry_run:
+    if dry_run:
         sys.exit(0)
     else:
         r = subprocess.run(cmd, capture_output=True, text=True)
         print(r.stdout)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(prog="screen layout",
+                                     description="configure connected monitors")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("-t", "--dry-run", action="store_true")
+
+    subparsers = parser.add_subparsers(dest='command', required=True)
+    show_parser = subparsers.add_parser("show",
+                                        help="Show detected monitors")
+
+    configure_parser = subparsers.add_parser("configure",
+                                             help="Configure screens")
+    configure_parser.add_argument("layout",
+                                  help="monitor layout",
+                                  choices=("pp", "lp", "pl", "ll", "tt", "off"))
+
+    args = parser.parse_args()
+
+    if args.command == "show":
+        show_main()
+    elif args.command == "configure":
+        configure_main(args.layout,
+                       args.verbose,
+                       args.dry_run)
