@@ -264,12 +264,20 @@ def show_main():
         print(s)
 
 
-def configure_main(layout_name, verbose=False, dry_run=False):
+def configure_main(layout_name,
+                   left_serial=None,
+                   right_serial=None,
+                   verbose=False,
+                   dry_run=False):
     d = Display(xdisplay.Display())
-    layouts = build_layouts(d.screens)
+    layouts = build_layouts(screens=d.screens,
+                            left_serial=left_serial,
+                            right_serial=right_serial)
     layout = layouts[layout_name]
     opts = xrandr_command(layout)
     if verbose:
+        print(f"left: {left_serial or 'none'}")
+        print(f"right: {right_serial or 'none'}")
         for c in opts:
             print("xrandr", *c)
 
@@ -288,23 +296,30 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="screen layout",
                                      description="configure connected monitors")
     parser.add_argument("-v", "--verbose", action="store_true")
-    parser.add_argument("-t", "--dry-run", action="store_true")
 
     subparsers = parser.add_subparsers(dest='command', required=True)
-    show_parser = subparsers.add_parser("show",
-                                        help="Show detected monitors")
+    sp = subparsers.add_parser("show",
+                               help="Show detected monitors")
 
-    configure_parser = subparsers.add_parser("configure",
-                                             help="Configure screens")
-    configure_parser.add_argument("layout",
-                                  help="monitor layout",
-                                  choices=("pp", "lp", "pl", "ll", "tt", "off"))
+    cp = subparsers.add_parser("configure",
+                               help="Configure screens")
+    cp.add_argument("layout",
+                    help="monitor layout",
+                    choices=("pp", "lp", "pl", "ll", "tt", "off"))
+    cp.add_argument("-t", "--dry-run", action="store_true",
+                    help="print xrandr commands, but do not run them")
+    cp.add_argument("-l", "--left-serial", type=str, default=None,
+                    help="Serial number of left monitor (from EDID)")
+    cp.add_argument("-r", "--right-serial", type=str, default=None,
+                    help="Serial number of right monitor (from EDID)")
 
     args = parser.parse_args()
 
     if args.command == "show":
         show_main()
     elif args.command == "configure":
-        configure_main(args.layout,
-                       args.verbose,
-                       args.dry_run)
+        configure_main(layout_name=args.layout,
+                       left_serial=args.left_serial,
+                       right_serial=args.right_serial,
+                       verbose=args.verbose,
+                       dry_run=args.dry_run)
